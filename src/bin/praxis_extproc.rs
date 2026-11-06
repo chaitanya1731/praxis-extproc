@@ -12,6 +12,7 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
+    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV, GRPC_RECV_FRAMING_HEADROOM},
     server::PraxisExtProc,
     tls,
 };
@@ -31,6 +32,11 @@ struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "praxis-extproc.yaml")]
     config: String,
+
+    /// Run the gated SSE backend used by Kubernetes qualification tests.
+    #[cfg(feature = "k8s-e2e")]
+    #[arg(long)]
+    e2e_sse_backend: bool,
 
     /// Override the gRPC listen address.
     #[arg(long)]
@@ -58,15 +64,33 @@ async fn main() {
     init_tracing();
     let cli = Cli::parse();
 
-    if let Err(e) = Box::pin(run(cli)).await {
+    if let Err(e) = Box::pin(run_command(cli)).await {
         error!(error = %e, "fatal");
         process::exit(1);
     }
 }
 
+/// Dispatch the qualification fixture or the ExtProc server.
+async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "k8s-e2e")]
+    if cli.e2e_sse_backend {
+        return Ok(praxis_extproc::e2e::sse_backend::serve().await?);
+    }
+    Box::pin(run(cli)).await
+}
+
 // -----------------------------------------------------------------------------
 // Startup
 // -----------------------------------------------------------------------------
+
+/// Per-message and cumulative body ceilings resolved at startup.
+#[derive(Clone, Copy)]
+struct BodyLimits {
+    /// Cumulative body accumulation across streamed chunks (`None` = unbounded).
+    max_body: Option<usize>,
+    /// Per-gRPC-message tonic decoding ceiling.
+    max_recv: usize,
+}
 
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -74,17 +98,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // TLS configuration: the provider installed here is the only one there is.
     let fips = praxis_extproc::fips::install()?;
 
+    // Fail closed on a bad `GRPC_MAX_RECV_MSG_SIZE` before validate/sidecars so
+    // `praxis-extproc -t` matches serve-time behaviour for this override.
+    let max_recv = grpc_limits::resolve_grpc_max_recv_msg_size()?;
+
     let cfg = load_config(&cli.config)?;
-    let registry = praxis_ai_filters::build_ai_registry();
+    let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
+    let limits = BodyLimits {
+        max_body: cfg.max_body_accumulation(),
+        max_recv,
+    };
 
     if cli.validate {
-        if let Some(reason) = fips_refusal(&fips, &registry) {
-            return Err(reason.into());
-        }
-        pipeline?;
-        info!("configuration is valid");
-        return Ok(());
+        resolve_addresses(&cli, &cfg)?;
+        return validate_config(&cfg.server, &fips, &registry, pipeline, limits);
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
@@ -101,10 +129,85 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         addrs,
         pipeline,
         &cfg.server,
-        cfg.max_body_accumulation(),
+        limits,
         praxis_extproc::fips::active(&fips),
     ))
     .await
+}
+
+/// `--validate` path after listener resolution: FIPS refusal, pipeline build,
+/// TLS, and already-resolved limits.
+///
+/// Soft-warns when [`BodyLimits::max_recv`] cannot carry a BUFFERED body at the
+/// accumulation ceiling, but still exits successfully (`0`) so operators can
+/// catch the misconfig without blocking startup scripts.
+fn validate_config(
+    server_cfg: &config::ServerConfig,
+    fips: &praxis_extproc::fips::Status,
+    registry: &praxis_filter::FilterRegistry,
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+    limits: BodyLimits,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(reason) = fips_refusal(fips, registry) {
+        return Err(reason.into());
+    }
+    pipeline?;
+    drop(tls::build_tls_config(&server_cfg.tls)?);
+    warn_if_buffered_body_cannot_fit_recv(limits);
+    info!(
+        max_body_bytes = ?limits.max_body,
+        max_recv_bytes = limits.max_recv,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "configuration is valid"
+    );
+    Ok(())
+}
+
+/// Whether a BUFFERED body of size `max_body` cannot fit under `max_recv`.
+///
+/// Requires [`GRPC_RECV_FRAMING_HEADROOM`] above the raw body so protobuf
+/// framing of `ProcessingRequest` does not trip tonic before the 413 path.
+fn buffered_body_cannot_fit_recv(max_body: Option<usize>, max_recv: usize) -> bool {
+    max_body.is_some_and(|n| max_recv < n.saturating_add(GRPC_RECV_FRAMING_HEADROOM))
+}
+
+/// Soft warning when tonic would reject an exactly-at-limit BUFFERED body.
+fn warn_if_buffered_body_cannot_fit_recv(limits: BodyLimits) {
+    if !buffered_body_cannot_fit_recv(limits.max_body, limits.max_recv) {
+        return;
+    }
+    // `buffered_body_cannot_fit_recv` is true only when `max_body` is `Some`.
+    let Some(max_body) = limits.max_body else {
+        return;
+    };
+    warn!(
+        max_body_bytes = max_body,
+        max_recv_bytes = limits.max_recv,
+        framing_headroom_bytes = GRPC_RECV_FRAMING_HEADROOM,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "gRPC receive ceiling is below max_body_bytes plus ProcessingRequest framing headroom; an at-limit BUFFERED body can fail at tonic decode with HTTP 500 instead of ImmediateResponse 413"
+    );
+}
+
+
+/// Build the AI filter registry, plus the k8s e2e body-oracle when
+/// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
+/// never enables that feature).
+#[cfg(feature = "k8s-e2e")]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    praxis_extproc::e2e::register_e2e_filters(&mut registry)?;
+    Ok(registry)
+}
+
+/// Build the AI filter registry (no e2e-only filters).
+#[cfg(not(feature = "k8s-e2e"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same Result signature as the k8s-e2e registry builder"
+)]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(praxis_ai_filters::build_ai_registry())
 }
 
 /// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
@@ -126,7 +229,7 @@ async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
-    max_body: Option<usize>,
+    limits: BodyLimits,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -136,7 +239,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, max_body, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server_cfg, limits, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -150,11 +253,11 @@ async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
-    max_body: Option<usize>,
+    limits: BodyLimits,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
+        serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx)
     }))
     .await
 }
@@ -271,17 +374,28 @@ async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
-    max_body: Option<usize>,
+    limits: BodyLimits,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
+    // bound cumulative body bytes reassembled across streamed chunks.
+    warn_if_buffered_body_cannot_fit_recv(limits);
+    info!(
+        max_body_bytes = ?limits.max_body,
+        max_recv_bytes = limits.max_recv,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "gRPC max decoding message size configured"
+    );
+
     // The latch fires when the drain deadline expires, forcing any streams still
     // running after graceful shutdown began to cancel.
     let (force_tx, force_rx) = tokio::sync::watch::channel(false);
-    let svc = ExternalProcessorServer::new(
+    let svc = praxis_extproc::server::external_processor_server(
         PraxisExtProc::new(pipeline)
-            .with_max_body_accumulation(max_body)
+            .with_max_body_accumulation(limits.max_body)
             .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
             .with_force_shutdown(force_rx.clone()),
+        limits.max_recv,
     );
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
     let controls = ShutdownControls {
@@ -535,5 +649,20 @@ mod tests {
         serve_bounded(serve, force_rx)
             .await
             .expect("normal completion is not an error");
+    }
+
+    #[test]
+    fn buffered_body_fit_check_requires_framing_headroom() {
+        const BODY: usize = 32 * 1024 * 1024;
+        assert!(!buffered_body_cannot_fit_recv(None, 1));
+        // Exact default pairing: body + headroom fits.
+        assert!(!buffered_body_cannot_fit_recv(
+            Some(BODY),
+            BODY + GRPC_RECV_FRAMING_HEADROOM
+        ));
+        // One byte of headroom is not enough once protobuf framing is counted.
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY + 1));
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY));
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY - 1));
     }
 }
